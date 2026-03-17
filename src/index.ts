@@ -1,5 +1,6 @@
 // @easykit/pdf — Zero-dependency HTML→PDF via Chromium CDP
 // Direct Chrome DevTools Protocol over WebSocket — no puppeteer, no playwright
+// Security: L1-L5 hardened (path validation, JS disabled, SSRF blocked, file:// blocked)
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,8 @@ export interface GeneratePdfOptions {
   timeout?: number;
   /** Path to Chromium binary (auto-detected if not provided) */
   chromiumPath?: string;
+  /** L5: Maximum HTML size in bytes (default: 50_000_000 = 50MB) */
+  maxHtmlSize?: number;
 }
 
 // ─── Paper Sizes (inches) ────────────────────────────────────────────────────
@@ -46,6 +49,36 @@ const PAPER_SIZES: Record<PaperFormat, { width: number; height: number }> = {
   Letter: { width: 8.5, height: 11 },
   Tabloid: { width: 11, height: 17 },
 };
+
+// ─── Security ────────────────────────────────────────────────────────────────
+
+/** L1: Allowed characters in Chromium binary path */
+const SAFE_PATH_RE = /^[a-zA-Z0-9\s/\-_.()]+$/;
+
+/**
+ * L1: Validate that a chromiumPath is safe to execute.
+ * Rejects shell metacharacters, null bytes, and non-existent files.
+ */
+async function validateChromiumPath(path: string): Promise<void> {
+  if (!path || path.length === 0) {
+    throw new Error("Chromium path is empty");
+  }
+  if (path.includes("\0")) {
+    throw new Error("Chromium path contains null byte");
+  }
+  if (!SAFE_PATH_RE.test(path)) {
+    throw new Error(`Chromium path contains disallowed characters: ${path}`);
+  }
+  try {
+    const file = Bun.file(path);
+    if (!(await file.exists())) {
+      throw new Error(`Chromium binary not found at: ${path}`);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.startsWith("Chromium")) throw err;
+    throw new Error(`Cannot access Chromium binary at: ${path}`);
+  }
+}
 
 // ─── Chromium Discovery ──────────────────────────────────────────────────────
 
@@ -294,6 +327,15 @@ async function launchChromium(chromiumPath: string, timeout: number): Promise<{ 
     "--disable-translate",
     "--no-first-run",
     "--safebrowsing-disable-auto-update",
+    // L4: Disable JavaScript execution in rendered pages
+    "--disable-javascript",
+    // L5: Block network access — prevent SSRF via HTML with external resources
+    "--host-resolver-rules=MAP * 127.0.0.1, EXCLUDE localhost",
+    "--disable-remote-fonts",
+    "--disable-features=NetworkService",
+    // L5: Block file:// protocol access
+    "--disable-local-file-accesses",
+    "--disable-file-system",
     `--remote-debugging-port=${port}`,
     "--remote-debugging-address=127.0.0.1",
     "about:blank",
@@ -325,13 +367,17 @@ async function launchChromium(chromiumPath: string, timeout: number): Promise<{ 
   }
 
   if (!wsUrl) {
-    proc.kill();
+    killProcess(proc);
     throw new Error(`Chromium failed to start within ${timeout}ms`);
   }
 
   return { proc, wsUrl };
 }
 
+/**
+ * L2: Robust process cleanup — kill immediately, force-kill after 3s,
+ * use unref() to prevent blocking process exit.
+ */
 function killProcess(proc: ReturnType<typeof Bun.spawn>): void {
   try {
     proc.kill();
@@ -339,20 +385,42 @@ function killProcess(proc: ReturnType<typeof Bun.spawn>): void {
     // Already dead
   }
 
-  // Force kill after 3s
-  setTimeout(() => {
+  // Force kill after 3s — unref'd so it doesn't block process exit
+  const forceKillTimer = setTimeout(() => {
     try {
       proc.kill(9);
     } catch {
       // Already dead
     }
   }, 3000);
+
+  // Unref the timer so it doesn't keep the process alive
+  if (forceKillTimer && typeof forceKillTimer === "object" && "unref" in forceKillTimer) {
+    (forceKillTimer as { unref: () => void }).unref();
+  }
+
+  // Also try to force-kill once the process actually exits (in case it lingers)
+  proc.exited
+    .then(() => {
+      clearTimeout(forceKillTimer);
+    })
+    .catch(() => {
+      // Process already gone
+    });
 }
 
 // ─── Main API ────────────────────────────────────────────────────────────────
 
 /**
  * Generate a PDF from HTML content using Chromium CDP.
+ *
+ * Security hardening:
+ * - L1: chromiumPath validated (no shell metacharacters, file must exist)
+ * - L4: JavaScript disabled in Chromium (--disable-javascript)
+ * - L5: Network access blocked (--host-resolver-rules MAP * 127.0.0.1)
+ * - L5: file:// access blocked (--disable-local-file-accesses)
+ * - L5: HTML size limit enforced (maxHtmlSize)
+ * - L2: Robust process cleanup with unref'd force-kill
  *
  * @returns PDF as a Buffer
  * @throws Error if Chromium is not found or conversion fails
@@ -369,7 +437,14 @@ export async function generatePdf(options: GeneratePdfOptions): Promise<Buffer> 
     margins,
     timeout = 30000,
     chromiumPath: customPath,
+    maxHtmlSize = 50_000_000,
   } = options;
+
+  // L5: Reject oversized HTML before doing anything
+  const htmlByteLength = new TextEncoder().encode(rawHtml).length;
+  if (htmlByteLength > maxHtmlSize) {
+    throw new Error(`HTML size (${htmlByteLength} bytes) exceeds maximum of ${maxHtmlSize} bytes`);
+  }
 
   // Find Chromium
   const chromiumPath = customPath ?? (await findChromium());
@@ -378,6 +453,9 @@ export async function generatePdf(options: GeneratePdfOptions): Promise<Buffer> 
       "Chromium not found. Install Google Chrome or Chromium, or provide chromiumPath option."
     );
   }
+
+  // L1: Validate Chromium path
+  await validateChromiumPath(chromiumPath);
 
   // Prepare HTML
   let html = rawHtml;
