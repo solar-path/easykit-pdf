@@ -1,0 +1,10 @@
+{
+  "name": "@easykit/pdf",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "files": ["src"],
+  "peerDependencies": {
+    "typescript": ">=5.0"
+  }
+}
