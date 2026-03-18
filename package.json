@@ -1,10 +1,29 @@
 {
   "name": "@easykit/pdf",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "Zero-dependency HTML-to-PDF generation for Bun via Chromium CDP.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
-  "files": ["src"],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["pdf", "html-to-pdf", "chromium", "cdp", "bun"],
+  "author": "solar-path",
+  "license": "MIT",
   "devDependencies": {
     "@types/bun": "^1.3.0",
     "typescript": "^5.4"
