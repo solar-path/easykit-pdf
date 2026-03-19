@@ -80,6 +80,26 @@ async function validateChromiumPath(path: string): Promise<void> {
   }
 }
 
+// ─── Free Port Discovery ─────────────────────────────────────────────────────
+
+/**
+ * Find a free TCP port in the ephemeral range (49152–65535) by briefly
+ * binding a Bun server and then stopping it. Retries up to 20 times.
+ */
+async function pickFreePort(): Promise<number> {
+  for (let attempts = 0; attempts < 20; attempts++) {
+    const port = 49152 + Math.floor(Math.random() * 16383);
+    try {
+      const server = Bun.serve({ port, fetch: () => new Response("") });
+      server.stop();
+      return port;
+    } catch {
+      // port in use, retry
+    }
+  }
+  throw new Error("Could not find a free port for Chromium CDP");
+}
+
 // ─── Chromium Discovery ──────────────────────────────────────────────────────
 
 const CHROMIUM_PATHS = [
@@ -113,17 +133,16 @@ export async function findChromium(): Promise<string | null> {
     }
   }
 
-  // Try `which` as fallback
-  try {
-    const proc = Bun.spawn(["which", "google-chrome", "chromium", "chromium-browser"], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const found = text.trim().split("\n")[0]?.trim();
-    if (found && found.length > 0) return found;
-  } catch {
-    // which not available or no results
+  // Try `which` as fallback — one binary at a time for Alpine BusyBox compatibility
+  for (const name of ["google-chrome", "chromium", "chromium-browser"]) {
+    try {
+      const proc = Bun.spawn(["which", name], { stdout: "pipe", stderr: "ignore" });
+      const text = (await new Response(proc.stdout).text()).trim();
+      // Reject empty results and any error prose (which contains spaces like "not found")
+      if (text.length > 0 && !text.includes(" ")) return text;
+    } catch {
+      // which not available or no results
+    }
   }
 
   return null;
@@ -218,6 +237,11 @@ interface CdpResponse {
   error?: { code: number; message: string };
 }
 
+interface CdpEvent {
+  method: string;
+  params?: Record<string, unknown>;
+}
+
 class CdpConnection {
   private ws: WebSocket;
   private messageId = 0;
@@ -226,6 +250,7 @@ class CdpConnection {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+  private eventListeners = new Map<string, Array<() => void>>();
   private ready: Promise<void>;
 
   constructor(wsUrl: string, private operationTimeout: number) {
@@ -245,15 +270,21 @@ class CdpConnection {
 
     this.ws.onmessage = (event: MessageEvent) => {
       try {
-        const data = JSON.parse(String(event.data)) as CdpResponse;
-        const pending = this.pending.get(data.id);
+        const raw = JSON.parse(String(event.data)) as CdpResponse | CdpEvent;
+        if ("method" in raw) {
+          // CDP push event — dispatch to registered listeners
+          for (const cb of this.eventListeners.get(raw.method) ?? []) cb();
+          return;
+        }
+        // CDP response
+        const pending = this.pending.get(raw.id);
         if (pending) {
           clearTimeout(pending.timer);
-          this.pending.delete(data.id);
-          if (data.error) {
-            pending.reject(new Error(`CDP error: ${data.error.message}`));
+          this.pending.delete(raw.id);
+          if (raw.error) {
+            pending.reject(new Error(`CDP error: ${raw.error.message}`));
           } else {
-            pending.resolve(data.result ?? {});
+            pending.resolve(raw.result ?? {});
           }
         }
       } catch {
@@ -272,6 +303,12 @@ class CdpConnection {
 
   async waitForReady(): Promise<void> {
     return this.ready;
+  }
+
+  on(method: string, callback: () => void): void {
+    const list = this.eventListeners.get(method) ?? [];
+    list.push(callback);
+    this.eventListeners.set(method, list);
   }
 
   send(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -312,7 +349,7 @@ class CdpConnection {
 // ─── Process Management ──────────────────────────────────────────────────────
 
 async function launchChromium(chromiumPath: string, timeout: number): Promise<{ proc: ReturnType<typeof Bun.spawn>; wsUrl: string }> {
-  const port = 9222 + Math.floor(Math.random() * 1000);
+  const port = await pickFreePort();
   const args = [
     "--headless=new",
     "--disable-gpu",
@@ -351,6 +388,10 @@ async function launchChromium(chromiumPath: string, timeout: number): Promise<{ 
   let wsUrl: string | null = null;
 
   while (Date.now() < deadline) {
+    // Fail fast if Chromium already exited (crash, missing libs, etc.)
+    if (proc.exitCode !== null) {
+      throw new Error(`Chromium exited unexpectedly (code ${proc.exitCode})`);
+    }
     try {
       const resp = await fetch(`http://127.0.0.1:${port}/json/version`);
       if (resp.ok) {
@@ -500,36 +541,25 @@ export async function generatePdf(options: GeneratePdfOptions): Promise<Buffer> 
     // Enable Page domain
     await cdp.send("Page.enable");
 
+    // Subscribe to load event BEFORE navigating so we don't miss it.
+    // Page.loadEventFired is a CDP push event — no JS execution needed,
+    // so it works correctly even with --disable-javascript.
+    const pageLoaded = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("Page load timeout")),
+        Math.max(5000, deadline - Date.now())
+      );
+      cdp!.on("Page.loadEventFired", () => {
+        clearTimeout(timer);
+        // Small delay for CSS rendering to settle
+        setTimeout(resolve, 200);
+      });
+    });
+
     // Navigate to data URL with HTML content
     const dataUrl = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
     await cdp.send("Page.navigate", { url: dataUrl });
-
-    // Wait for page load
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Page load timeout")), Math.max(5000, deadline - Date.now()));
-
-      // Give the page time to render
-      const checkLoaded = async () => {
-        try {
-          const result = await cdp!.send("Runtime.evaluate", {
-            expression: "document.readyState",
-            returnByValue: true,
-          });
-          const value = (result?.result as Record<string, unknown>)?.value;
-          if (value === "complete" || value === "interactive") {
-            clearTimeout(timer);
-            // Small delay for rendering
-            setTimeout(resolve, 200);
-          } else {
-            setTimeout(checkLoaded, 100);
-          }
-        } catch {
-          clearTimeout(timer);
-          resolve(); // Proceed anyway
-        }
-      };
-      checkLoaded();
-    });
+    await pageLoaded;
 
     // Check deadline
     if (Date.now() >= deadline) {
